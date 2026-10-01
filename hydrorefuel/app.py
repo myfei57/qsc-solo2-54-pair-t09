@@ -2,8 +2,8 @@
 
 ``Platform`` 把各组件按真实调用链接起来，并暴露四件事：操作编排（卸氢、增压
 充瓶、加注、停止加注）、控制周期、并发仲裁探测和状态快照。控制周期每个周期
-做三件事：核对加注确认是否超时、采集瓶组压力趋势、把平台计数落盘；跨模块
-动作都由编排一次性走完并写审计。
+处理预约到点放行/过号判定、核对加注确认是否超时、采集瓶组压力趋势、把平台
+计数落盘；跨模块动作都由编排一次性走完并写审计。
 """
 
 from __future__ import annotations
@@ -148,6 +148,32 @@ class Platform:
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
 
+    def _publish_order_change(self, change: dict, message: str, severity: str = "notice") -> None:
+        """把一次顺序变更作为完整嵌套上下文落审计。"""
+
+        compensation_ids = list(change.get("compensation_ids", []))
+        compensations = [item for item in self.queue.compensations(limit=1000) if item["id"] in compensation_ids]
+        self.bus.publish(
+            Event.of(
+                "queue",
+                "queue",
+                "order_changed",
+                severity=severity,
+                station=self.unit,
+                message=message,
+                change_id=change.get("id"),
+                change_action=change.get("action"),
+                reason=change.get("reason"),
+                actor=change.get("actor"),
+                promoted_vehicle=change.get("promoted_vehicle"),
+                before_order=list(change.get("before_order", [])),
+                after_order=list(change.get("after_order", [])),
+                compensation_ids=compensation_ids,
+                compensations=compensations,
+                request_id=change.get("request_id"),
+            )
+        )
+
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
 
@@ -284,6 +310,9 @@ class Platform:
             except HydroError as error:
                 self.note_error(error)
                 return {"station": self.unit, "vehicle": vehicle, "ok": False, "violations": ["line_pressure_high"]}
+            dispatch = self.queue.begin_service(vehicle, self.clock.now())
+            if dispatch.get("order_change") is not None:
+                self._publish_order_change(dispatch["order_change"], "队首车辆进入加注服务")
             before = self.meter.total_kg()
             report = fill_vehicle(
                 self.dispenser,
@@ -305,10 +334,21 @@ class Platform:
                     self.bank.draw(self.meter.total_kg() - before)
                 except HydroError as error:
                     self.note_error(error)
+            service = self.queue.complete_service(vehicle)
+            self.bus.publish(
+                Event.of(
+                    "queue",
+                    "queue",
+                    "service_complete",
+                    severity="notice",
+                    vehicle=vehicle,
+                    completed=service["completed"],
+                )
+            )
             summary = self._record_operation(op_id, "fill", report)
             self._operations += 1
             self._persist()
-            return {**report, **summary}
+            return {**report, **summary, "dispatch": dispatch, "service": service}
 
     def stop_fill(self) -> dict:
         """停止加注编排：先隔离，再停机。"""
@@ -379,21 +419,207 @@ class Platform:
             "within_band": self.bank.within_band(),
         }
 
-    def enqueue_vehicle(self, vehicle: str) -> dict:
-        """把车辆加入加注队列，返回排队位次。"""
+    def enqueue_vehicle(
+        self,
+        vehicle: str,
+        *,
+        use_reservation: bool = True,
+    ) -> dict:
+        """把车辆加入加注队列，返回排队位次与本次顺序变更。"""
 
         with self._lock:
-            position = self.queue.enqueue(vehicle, self.clock.now())
-            self.bus.publish(Event.of("queue", "queue", "enqueue", severity="notice", vehicle=vehicle, position=position))
-            return {"vehicle": vehicle, "position": position, "size": self.queue.size()}
+            result = self.queue.checkin(vehicle, self.clock.now(), use_reservation=use_reservation)
+            self.bus.publish(
+                Event.of(
+                    "queue",
+                    "queue",
+                    "enqueue",
+                    severity="notice",
+                    vehicle=vehicle,
+                    position=result["position"],
+                    kind=result["kind"],
+                    status=result["status"],
+                    scheduled_at=result["scheduled_at"],
+                )
+            )
+            change = result.get("order_change")
+            if change is not None:
+                self._publish_order_change(change, "预约到点放行，等待顺序已重排")
+            return result
+
+    def book_appointment(
+        self,
+        vehicle: str,
+        scheduled_at: float,
+        *,
+        request_id: str | None = None,
+    ) -> dict:
+        """登记预约。策略固定为到点放行，不提前预留车位。"""
+
+        with self._lock:
+            result = self.queue.reserve(
+                vehicle,
+                float(scheduled_at),
+                self.clock.now(),
+                request_id=request_id,
+            )
+            if result.get("idempotent_replayed") or not result.get("changed"):
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "appointment_booked_idempotent",
+                        severity="notice",
+                        vehicle=vehicle,
+                        request_id=request_id,
+                    )
+                )
+            else:
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "appointment_booked",
+                        severity="notice",
+                        message="预约已登记；到点放行，不提前预留位",
+                        vehicle=vehicle,
+                        scheduled_at=result["reservation"]["scheduled_at"],
+                        changed=result["changed"],
+                        request_id=request_id,
+                        policy=result["policy"],
+                    )
+                )
+            return result
+
+    def release_appointment(
+        self,
+        vehicle: str,
+        *,
+        request_id: str | None = None,
+    ) -> dict:
+        """人工放行已到点的预约车；重复调用保持幂等。"""
+
+        with self._lock:
+            result = self.queue.release_appointment(
+                vehicle,
+                self.clock.now(),
+                request_id=request_id,
+            )
+            if result.get("idempotent_replayed"):
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "appointment_release_idempotent",
+                        severity="notice",
+                        vehicle=vehicle,
+                        request_id=request_id,
+                    )
+                )
+            elif result.get("changed"):
+                self._publish_order_change(result["order_change"], "人工放行预约车，等待顺序已重排")
+            else:
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "appointment_release_idempotent",
+                        severity="notice",
+                        vehicle=vehicle,
+                        request_id=request_id,
+                    )
+                )
+            return result
+
+    def urgent_insert(
+        self,
+        vehicle: str,
+        *,
+        reason: str = "manual_urgent",
+        request_id: str | None = None,
+    ) -> dict:
+        """临时加急插队，并为被后挤的等待车辆登记补偿。"""
+
+        with self._lock:
+            result = self.queue.urgent(
+                vehicle,
+                self.clock.now(),
+                reason=reason,
+                request_id=request_id,
+            )
+            if result.get("idempotent_replayed"):
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "urgent_insert_idempotent",
+                        severity="notice",
+                        vehicle=vehicle,
+                        request_id=request_id,
+                    )
+                )
+            elif result.get("changed"):
+                self._publish_order_change(
+                    result["order_change"],
+                    f"临时加急：{vehicle}",
+                    severity="warning",
+                )
+            return result
+
+    def close_shift(self) -> dict:
+        """本班结束，按站点过号策略清理保留预约。"""
+
+        with self._lock:
+            result = self.queue.close_shift(self.clock.now())
+            if result["changed"]:
+                self._publish_order_change(result["order_change"], "本班结束，保留的过号预约作废")
+            return result
 
     def dequeue_vehicle(self) -> dict:
-        """取出队首车辆并为其发起确认。"""
+        """取出当前可放行的队首车辆并为其发起确认。"""
 
         with self._lock:
-            vehicle = self.queue.dequeue()
+            outstanding = self.confirm.outstanding()
+            if outstanding:
+                vehicle = outstanding[0]
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "dequeue_idempotent",
+                        severity="notice",
+                        vehicle=vehicle,
+                        size=self.queue.size(),
+                    )
+                )
+                return {
+                    "vehicle": vehicle,
+                    "from_queue": True,
+                    "position": 0,
+                    "idempotent_replayed": True,
+                    "size": self.queue.size(),
+                }
+            result = self.queue.dispatch(self.clock.now())
+            vehicle = result["vehicle"]
             self.confirm.open(vehicle, self.clock.now())
-            return {"vehicle": vehicle, "size": self.queue.size(), "position": self.queue.position(vehicle)}
+            if result.get("order_change") is not None:
+                self._publish_order_change(result["order_change"], "队首车辆被叫号放行")
+            self.bus.publish(
+                Event.of(
+                    "queue",
+                    "queue",
+                    "dequeue",
+                    severity="notice",
+                    vehicle=vehicle,
+                    size=self.queue.size(),
+                    position=0,
+                    from_queue=result["from_queue"],
+                )
+            )
+            return {
+                **result,
+                "size": self.queue.size(),
+            }
 
     def namespace(self, address: str) -> dict:
         """按地址解析现场设备。"""
@@ -433,9 +659,35 @@ class Platform:
             for vehicle in self.confirm.outstanding():
                 if self.confirm.expired(vehicle, moment):
                     self.confirm.clear(vehicle)
+                    service = self.queue.complete_service(vehicle)
                     self.bus.publish(
                         Event.of("queue", "queue", "confirm_expired", severity="warning", vehicle=vehicle)
                     )
+                    self.bus.publish(
+                        Event.of(
+                            "queue",
+                            "queue",
+                            "service_released",
+                            severity="warning",
+                            vehicle=vehicle,
+                            completed=service["completed"],
+                            reason="confirm_timeout",
+                        )
+                    )
+            queue_sweep = self.queue.sweep_due(moment)
+            for item in queue_sweep["released"]:
+                self._publish_order_change(item["order_change"], "预约时段到达，自动放行")
+            for item in queue_sweep["no_shows"]:
+                self.bus.publish(
+                    Event.of(
+                        "queue",
+                        "queue",
+                        "appointment_no_show",
+                        severity="warning",
+                        message="预约车过宽限期未到场",
+                        **item,
+                    )
+                )
             previous = self.trend.latest("buffer_pressure")
             pressure = self.bank.pressure_mpa
             self.trend.append("buffer_pressure", moment, pressure)
@@ -449,6 +701,8 @@ class Platform:
                 "buffer_delta_mpa": round(delta, 3),
                 "headroom_kg": round(self.bank.headroom_kg(), 3),
                 "queue_size": self.queue.size(),
+                "queue_released": len(queue_sweep["released"]),
+                "queue_no_shows": queue_sweep["no_shows"],
                 "outstanding_confirms": self.confirm.outstanding(),
                 "leak_tripped": self.leak.tripped(),
             }
@@ -626,6 +880,11 @@ class Platform:
             capacity=self.queue.limited.max_waiting,
             waiting=self.queue.waiting(),
             outstanding=self.confirm.outstanding(),
+            reservations=self.queue.reservations(),
+            active=self.queue.active(),
+            order_changes=self.queue.order_changes(),
+            compensations=self.queue.compensations(),
+            rules=self.queue.rules(),
         ).as_dict()
 
     def topology_summary(self) -> dict:

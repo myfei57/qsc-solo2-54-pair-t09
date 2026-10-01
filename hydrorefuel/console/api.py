@@ -67,6 +67,10 @@ class Api:
         add("POST", "/api/calibrate", self._calibrate)
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/enqueue", self._enqueue)
+        add("POST", "/api/appointment", self._appointment)
+        add("POST", "/api/appointment/release", self._release_appointment)
+        add("POST", "/api/queue/urgent", self._urgent)
+        add("POST", "/api/queue/close-shift", lambda params, body: self._platform.close_shift())
         add("POST", "/api/dequeue", lambda params, body: self._platform.dequeue_vehicle())
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/reset", lambda params, body: self._platform.reset_state())
@@ -180,7 +184,30 @@ class Api:
         return self._platform.disturb_buffer(_as_float(body, "delta_mpa", 0.0))
 
     def _enqueue(self, params: dict, body: dict) -> dict:
-        return self._platform.enqueue_vehicle(str(body.get("vehicle", "vehicle01")))
+        return self._platform.enqueue_vehicle(
+            str(body.get("vehicle", "vehicle01")),
+            use_reservation=bool(body.get("use_reservation", True)),
+        )
+
+    def _appointment(self, params: dict, body: dict) -> dict:
+        return self._platform.book_appointment(
+            str(body.get("vehicle", "vehicle01")),
+            _as_float(body, "scheduled_at", self._platform.clock.now()),
+            request_id=str(body["request_id"]) if body.get("request_id") is not None else None,
+        )
+
+    def _release_appointment(self, params: dict, body: dict) -> dict:
+        return self._platform.release_appointment(
+            str(body.get("vehicle", "vehicle01")),
+            request_id=str(body["request_id"]) if body.get("request_id") is not None else None,
+        )
+
+    def _urgent(self, params: dict, body: dict) -> dict:
+        return self._platform.urgent_insert(
+            str(body.get("vehicle", "vehicle01")),
+            reason=str(body.get("reason", "manual_urgent")),
+            request_id=str(body["request_id"]) if body.get("request_id") is not None else None,
+        )
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))

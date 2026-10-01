@@ -2,7 +2,8 @@
 
 配置来自 JSON 文件（标准库解析），覆盖槽车卸氢压力与放散确认阈值、压缩机
 入口与目标压力、瓶组压力带与基线有效期、预冷目标温度、流量阶梯公差、加注
-枪落座行程、泄漏阀值与加注队列容量。任何缺失或越界取值都在装配阶段抛出
+枪落座行程、泄漏阀值、加注队列容量、预约宽限、过号策略与插队补偿。任何
+缺失或越界取值都在装配阶段抛出
 :class:`ConfigError`，不允许带着半份配置启动控制链。
 """
 
@@ -47,6 +48,15 @@ def _integer(section: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
         raise ConfigError(f"配置字段 {key!r} 必须是整数", component="config")
     if value < minimum:
         raise ConfigError(f"配置字段 {key!r} 不得小于 {minimum}", component="config")
+    return value
+
+
+def _choice(section: Mapping[str, Any], key: str, choices: tuple[str, ...]) -> str:
+    value = section.get(key, _MISSING)
+    if value is _MISSING:
+        raise ConfigError(f"配置缺少字段 {key!r}", component="config")
+    if not isinstance(value, str) or value not in choices:
+        raise ConfigError(f"配置字段 {key!r} 必须是 {choices} 之一", component="config")
     return value
 
 
@@ -261,16 +271,30 @@ class LeakLimits:
 
 @dataclass(frozen=True)
 class QueueLimits:
-    """加注队列容量与确认超时约束。"""
+    """加注队列容量、预约、过号与补偿约束。"""
 
     max_waiting: int
     confirm_timeout_s: float
+    appointment_grace_s: float
+    no_show_policy: str
+    compensation_credit_s_per_place: float
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "QueueLimits":
         return cls(
             max_waiting=_integer(section, "max_waiting", minimum=1),
             confirm_timeout_s=_number(section, "confirm_timeout_s", minimum=1.0),
+            appointment_grace_s=_number(section, "appointment_grace_s", minimum=0.0),
+            no_show_policy=_choice(
+                section,
+                "no_show_policy",
+                ("void_and_requeue", "retain_to_shift_end"),
+            ),
+            compensation_credit_s_per_place=_number(
+                section,
+                "compensation_credit_s_per_place",
+                minimum=0.0,
+            ),
         )
 
 
@@ -342,7 +366,13 @@ def default_config() -> StationConfig:
         flow=FlowLimits(1.8, 0.15, 3.6, 0.4),
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
-        queue=QueueLimits(12, 45.0),
+        queue=QueueLimits(
+            max_waiting=12,
+            confirm_timeout_s=45.0,
+            appointment_grace_s=120.0,
+            no_show_policy="void_and_requeue",
+            compensation_credit_s_per_place=300.0,
+        ),
     )
 
 
@@ -403,6 +433,9 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+                "appointment_grace_s": cfg.queue.appointment_grace_s,
+                "no_show_policy": cfg.queue.no_show_policy,
+                "compensation_credit_s_per_place": cfg.queue.compensation_credit_s_per_place,
             },
         },
     }

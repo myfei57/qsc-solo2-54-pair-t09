@@ -54,7 +54,10 @@
     },
     "queue": {
       "max_waiting": 12,
-      "confirm_timeout_s": 45.0
+      "confirm_timeout_s": 45.0,
+      "appointment_grace_s": 120.0,
+      "no_show_policy": "void_and_requeue",
+      "compensation_credit_s_per_place": 300.0
     }
   }
 }
