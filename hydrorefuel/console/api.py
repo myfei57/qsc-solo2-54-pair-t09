@@ -68,6 +68,14 @@ class Api:
         add("POST", "/api/disturb", self._disturb)
         add("POST", "/api/enqueue", self._enqueue)
         add("POST", "/api/dequeue", lambda params, body: self._platform.dequeue_vehicle())
+        add("POST", "/api/reserve", self._reserve)
+        add("POST", "/api/arrive", self._arrive)
+        add("POST", "/api/urgent", self._urgent)
+        add("POST", "/api/release", self._release)
+        add("POST", "/api/reservation/cancel", self._cancel_reservation)
+        add("POST", "/api/shift/end", lambda params, body: self._platform.end_shift())
+        add("GET", "/api/queue/changes", self._queue_changes)
+        add("GET", "/api/queue/compensations", self._queue_compensations)
         add("POST", "/api/concurrency", self._concurrency)
         add("POST", "/api/reset", lambda params, body: self._platform.reset_state())
 
@@ -181,6 +189,40 @@ class Api:
 
     def _enqueue(self, params: dict, body: dict) -> dict:
         return self._platform.enqueue_vehicle(str(body.get("vehicle", "vehicle01")))
+
+    def _reserve(self, params: dict, body: dict) -> dict:
+        return self._platform.reserve_vehicle(
+            str(body.get("vehicle", "vehicle01")),
+            _as_float(body, "slot_ts", self._platform.clock.now()),
+            str(body["reservation_id"]) if body.get("reservation_id") is not None else None,
+        )
+
+    def _arrive(self, params: dict, body: dict) -> dict:
+        return self._platform.arrive_vehicle(
+            str(body.get("vehicle", "vehicle01")),
+            str(body["reservation_id"]) if body.get("reservation_id") is not None else None,
+        )
+
+    def _urgent(self, params: dict, body: dict) -> dict:
+        return self._platform.urgent_vehicle(
+            str(body.get("vehicle", "vehicle01")), str(body.get("reason", ""))
+        )
+
+    def _release(self, params: dict, body: dict) -> dict:
+        return self._platform.release_vehicle(str(body.get("vehicle", "vehicle01")))
+
+    def _cancel_reservation(self, params: dict, body: dict) -> dict:
+        return self._platform.cancel_reservation(str(body.get("reservation_id", "")))
+
+    def _queue_changes(self, params: dict, body: dict) -> dict:
+        return self._platform.queue_order_changes(limit=int(params.get("limit", 200)))
+
+    def _queue_compensations(self, params: dict, body: dict) -> dict:
+        vehicle = params.get("vehicle")
+        return self._platform.queue_compensations(
+            vehicle=str(vehicle) if vehicle is not None else None,
+            limit=int(params.get("limit", 200)),
+        )
 
     def _concurrency(self, params: dict, body: dict) -> dict:
         return self._platform.concurrency_probe(rounds=int(body.get("rounds", 24)))

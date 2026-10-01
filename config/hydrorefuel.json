@@ -54,7 +54,11 @@
     },
     "queue": {
       "max_waiting": 12,
-      "confirm_timeout_s": 45.0
+      "confirm_timeout_s": 45.0,
+      "scheduling_mode": "on_time_release",
+      "noshow_policy": "void",
+      "grace_s": 120.0,
+      "urgent_quota_per_shift": 2
     }
   }
 }

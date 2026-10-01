@@ -261,16 +261,44 @@ class LeakLimits:
 
 @dataclass(frozen=True)
 class QueueLimits:
-    """加注队列容量与确认超时约束。"""
+    """加注队列容量、确认超时与排队策略约束。"""
 
     max_waiting: int
     confirm_timeout_s: float
+    scheduling_mode: str
+    noshow_policy: str
+    grace_s: float
+    urgent_quota_per_shift: int
 
     @classmethod
     def from_mapping(cls, section: Mapping[str, Any]) -> "QueueLimits":
+        from .queue.policy import MODE_ON_TIME_RELEASE, NOSHOW_POLICIES
+
+        scheduling_mode = str(section.get("scheduling_mode", MODE_ON_TIME_RELEASE))
+        noshow_policy = str(section.get("noshow_policy", "void"))
+        grace_s = _number(section, "grace_s", minimum=0.0) if "grace_s" in section else 120.0
+        urgent_quota = _integer(section, "urgent_quota_per_shift", minimum=0) if "urgent_quota_per_shift" in section else 2
+        if scheduling_mode != MODE_ON_TIME_RELEASE:
+            raise ConfigError(
+                f"scheduling_mode 只支持 {MODE_ON_TIME_RELEASE!r}（预约按到点放行）", component="config"
+            )
+        if noshow_policy not in NOSHOW_POLICIES:
+            raise ConfigError(f"noshow_policy 必须是 {NOSHOW_POLICIES} 之一", component="config")
         return cls(
             max_waiting=_integer(section, "max_waiting", minimum=1),
             confirm_timeout_s=_number(section, "confirm_timeout_s", minimum=1.0),
+            scheduling_mode=scheduling_mode,
+            noshow_policy=noshow_policy,
+            grace_s=grace_s,
+            urgent_quota_per_shift=urgent_quota,
+        )
+
+    @property
+    def policy(self) -> "QueuePolicy":
+        from .queue.policy import QueuePolicy
+
+        return QueuePolicy.from_fields(
+            self.scheduling_mode, self.noshow_policy, self.grace_s, self.urgent_quota_per_shift
         )
 
 
@@ -342,7 +370,7 @@ def default_config() -> StationConfig:
         flow=FlowLimits(1.8, 0.15, 3.6, 0.4),
         dispenser=DispenserLimits(55.0, 15.0, 44.0, 2.0),
         leak=LeakLimits(4000.0, 5.0, 30.0),
-        queue=QueueLimits(12, 45.0),
+        queue=QueueLimits(12, 45.0, "on_time_release", "void", 120.0, 2),
     )
 
 
@@ -403,6 +431,10 @@ def config_to_mapping(cfg: StationConfig) -> dict:
             "queue": {
                 "max_waiting": cfg.queue.max_waiting,
                 "confirm_timeout_s": cfg.queue.confirm_timeout_s,
+                "scheduling_mode": cfg.queue.scheduling_mode,
+                "noshow_policy": cfg.queue.noshow_policy,
+                "grace_s": cfg.queue.grace_s,
+                "urgent_quota_per_shift": cfg.queue.urgent_quota_per_shift,
             },
         },
     }

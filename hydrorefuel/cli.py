@@ -72,6 +72,10 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     unload = platform.unload(hose_pressure_mpa=20.0, target_kg=args.target_kg)
     pressurize = platform.pressurize(inlet_pressure_mpa=12.0, flow_kg_per_min=4.0, charge_kg=12.0)
     disturbance = platform.disturb_buffer(delta_mpa=-1.0)
+    # 排队演示：一辆普通车先到，预约车踩着点到场被提序放行（附补偿记录）。
+    platform.enqueue_vehicle("vehicle02")
+    reservation = platform.reserve_vehicle("vehicle01", clock.now(), "demo-rsv-01")
+    platform.arrive_vehicle("vehicle01", reservation["reservation_id"])
     fill = platform.fill(vehicle="vehicle01", rate_kg_per_min=3.0, steps=args.steps)
     stop = platform.stop_fill()
     cycles = [platform.cycle(dt=1.0) for _ in range(6)]
@@ -94,6 +98,12 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "pressurize": {"ok": pressurize["ok"], "steps": [step["action"] for step in pressurize["steps"]]},
         "disturbance": disturbance,
         "fill": {"ok": fill["ok"], "steps": [step["action"] for step in fill["steps"]]},
+        "queue": {
+            "reservation": reservation,
+            "waiting": platform.queue.waiting(),
+            "order_changes": platform.queue.order_changes(limit=5),
+            "compensations": platform.queue.compensations(limit=5),
+        },
         "stop": {"ok": stop["ok"], "steps": [step["action"] for step in stop["steps"]]},
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
